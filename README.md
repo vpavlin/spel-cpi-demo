@@ -94,6 +94,83 @@ Environment knobs: `WORK_DIR` (or `$1`), `SKIP_BUILD`, `SEQUENCER_PORT`
 and wallet configs are read from; it must match the version the binaries were
 built from).
 
+## CI: testing new SPEL and LEZ versions
+
+`.github/workflows/e2e.yml` runs everything above against a chosen SPEL commit
+and a chosen LEZ node. SPEL's own `lez-compat` workflow only `cargo check`s, so
+a change that compiles but breaks account claims, PDA derivation or
+chained-call serialization passes it and fails here.
+
+```sh
+# SPEL main, node on the LEZ that commit pins (the default)
+gh workflow run e2e.yml -R vpavlin/spel-cpi-demo
+
+# same guests, newer chain — do today's programs still run on tomorrow's node?
+gh workflow run e2e.yml -R vpavlin/spel-cpi-demo -f lez_ref=v0.2.5-rc1
+
+# a SPEL branch (including SPEL's own `lez-bump/<sha>` branches)
+gh workflow run e2e.yml -R vpavlin/spel-cpi-demo -f spel_ref=my-feature-branch
+
+# from another repo's CI
+gh api repos/vpavlin/spel-cpi-demo/dispatches \
+  -f event_type=cpi-e2e -F 'client_payload[spel_ref]=my-branch'
+```
+
+It also runs on pushes to `main`, on pull requests, and twice every Monday —
+07:00 UTC with the node on the LEZ SPEL pins (*did SPEL regress?*) and 08:00 UTC
+with the node on LEZ `main` (*is LEZ about to break us?*).
+
+### Two LEZ versions, only one of them a choice
+
+The LEZ the guests are **compiled against** is whatever the SPEL commit pins,
+and `lez_ref` cannot change it. Cargo unifies git dependencies by source
+*string*, not by resolved commit, so pointing the guest at `rev = "47eba25…"`
+while `spel-framework` says `tag = "v0.2.4"` puts two copies of `lee_core` in
+the graph and the guest stops compiling:
+
+```
+expected `lee_core::account::data::Data`, found `lee_core::account::Data`
+note: two different versions of crate `lee_core` are being used
+```
+
+`[patch]` is the only mechanism that would force one version across both, and
+Cargo rejects a patch whose replacement is the same git source — including
+`.git`-suffix variants, which it canonicalizes. So `scripts/pin-versions.sh`
+copies SPEL's LEZ selector verbatim and then **asserts the lockfile contains
+exactly one `lee_core`**, which turns a fifteen-minute Docker failure into an
+immediate one.
+
+The LEZ the **node runs** is a free choice, and that is the more interesting
+axis anyway: `lez_ref` selects the sequencer, wallet and configs the programs
+are deployed against. Guests built on SPEL's pinned LEZ running against a newer
+node is a wire-and-validation-rule question that no `cargo check` can answer.
+To compile against a different LEZ, point `spel_ref` at a SPEL branch that pins
+it — SPEL's `lez-compat` workflow opens `lez-bump/<sha>` branches that do
+exactly that.
+
+### How it is put together
+
+| Job | What it does | Cache key |
+| --- | --- | --- |
+| `resolve` | Resolves both refs to commits and prints them in the run summary | — |
+| `lez` | Builds the node: `sequencer_service` (`--features standalone`) and `wallet` | node LEZ commit |
+| `guests` | Re-pins both guests to the SPEL commit and builds them in Docker | SPEL + guest LEZ commit + guest sources |
+| `e2e` | Builds the `spel` CLI at that SPEL commit and runs `scripts/e2e-test.sh` | SPEL commit |
+| `report` | On a scheduled or dispatched failure, opens (or comments on) one issue per version pair | — |
+
+The guests are **rebuilt against the SPEL commit under test**, not restored
+from a stale binary, so a red run is a real incompatibility. Both helper
+scripts run locally:
+
+```sh
+./scripts/resolve-ref.sh https://github.com/logos-co/spel.git main
+./scripts/pin-versions.sh main
+```
+
+A fully cold run takes roughly an hour, most of it the two Docker guest builds
+and the LEZ release build. With all three caches warm it is the `e2e` job only,
+a few minutes.
+
 ## Notes
 
 [NOTES.md](NOTES.md) records what had to be discovered outside the docs to get

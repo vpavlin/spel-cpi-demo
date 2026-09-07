@@ -73,16 +73,21 @@ command -v spel >/dev/null 2>&1 || fail "spel not on PATH"
 # to start without it. Read them out of the tagged tree instead of the
 # working tree, and only fall back to on-disk paths if the ref is missing.
 LEZ_REF="${LEZ_REF:-v0.2.4}"
-# Usage: lez_config <dst> <path-under-lez/> <legacy-worktree-path>
+
+# Copy a config out of the LEZ tree into <dst>. Candidate paths are tried in
+# order at $LEZ_REF first, then in the working tree — the configs moved under
+# `lez/` in v0.2.1, so a sweep across versions needs both layouts.
+# Usage: lez_config <dst> <candidate-path>...
 lez_config() {
-    local dst="$1" tracked="$2" legacy="$3"
-    if git -C "$LSSA_DIR" cat-file -e "${LEZ_REF}:${tracked}" 2>/dev/null; then
-        git -C "$LSSA_DIR" show "${LEZ_REF}:${tracked}" > "$dst" || return 1
-        return 0
-    fi
-    warn "${LEZ_REF}:${tracked} not found, falling back to the working tree"
-    for c in "$LSSA_DIR/$tracked" "$LSSA_DIR/$legacy"; do
-        [ -f "$c" ] && { cp "$c" "$dst"; return 0; }
+    local dst="$1" p; shift
+    for p in "$@"; do
+        if git -C "$LSSA_DIR" cat-file -e "${LEZ_REF}:${p}" 2>/dev/null; then
+            git -C "$LSSA_DIR" show "${LEZ_REF}:${p}" > "$dst" && return 0
+        fi
+    done
+    warn "no config found at ${LEZ_REF}; falling back to the working tree"
+    for p in "$@"; do
+        [ -f "$LSSA_DIR/$p" ] && { cp "$LSSA_DIR/$p" "$dst"; return 0; }
     done
     return 1
 }

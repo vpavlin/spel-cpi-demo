@@ -1,0 +1,366 @@
+# Runs the cross-program chained-call demo end to end on a real chain, against
+# a chosen SPEL and LEZ revision.
+#
+# The point is version compatibility: SPEL's own `lez-compat` workflow only
+# `cargo check`s, so a change that compiles but breaks account claims, PDA
+# derivation or chained-call serialization passes it. This one deploys two
+# programs, fires a chained call and reads the resulting PDA back by value.
+name: CPI e2e
+
+on:
+  workflow_dispatch:
+    inputs:
+      spel_ref:
+        description: 'SPEL ref (branch, tag or SHA)'
+        required: false
+        default: 'main'
+      lez_ref:
+        description: 'LEZ ref for the NODE (sequencer/wallet/configs). Empty = the one SPEL pins.'
+        required: false
+        default: ''
+  # Lets SPEL's CI (or anything with a token) ask for a run:
+  #   gh api repos/vpavlin/spel-cpi-demo/dispatches -f event_type=cpi-e2e \
+  #     -F 'client_payload[spel_ref]=my-branch'
+  repository_dispatch:
+    types: [cpi-e2e]
+  schedule:
+    # Two different questions, so two crons — the resolve job tells them apart
+    # by `github.event.schedule`.
+    - cron: '0 7 * * 1'   # node on the LEZ SPEL pins → did SPEL regress?
+    - cron: '0 8 * * 1'   # node on LEZ main          → is LEZ about to break us?
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  # The two Monday crons are an hour apart but a cold run takes longer than
+  # that, so they must not share a group or the second would cancel the first.
+  # Superseding only makes sense for pull requests.
+  group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event.schedule || github.event_name }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  RISC0_VERSION: "3.0.5"
+  SPEL_GIT: https://github.com/logos-co/spel.git
+  LEZ_GIT: https://github.com/logos-blockchain/logos-execution-zone.git
+
+jobs:
+  # ── Work out exactly which two commits this run is testing ──────────────
+  resolve:
+    name: Resolve versions
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      spel_sha:      ${{ steps.r.outputs.spel_sha }}
+      guest_lez_sha: ${{ steps.r.outputs.guest_lez_sha }}
+      node_lez_sha:  ${{ steps.r.outputs.node_lez_sha }}
+      mode:          ${{ steps.r.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve SPEL and LEZ commits
+        id: r
+        run: |
+          set -euo pipefail
+          SPEL_REF="${{ github.event.inputs.spel_ref || github.event.client_payload.spel_ref || 'main' }}"
+          LEZ_REF="${{ github.event.inputs.lez_ref || github.event.client_payload.lez_ref || '' }}"
+
+          # The 08:00 cron is the forward-compatibility sweep against LEZ tip.
+          if [ "${{ github.event.schedule }}" = '0 8 * * 1' ]; then
+            LEZ_REF=main
+          fi
+
+          SPEL_SHA=$(./scripts/resolve-ref.sh "$SPEL_GIT" "$SPEL_REF")
+          echo "SPEL $SPEL_REF -> $SPEL_SHA"
+
+          # The LEZ the guests are COMPILED against is not a choice: it is
+          # whatever the SPEL commit pins. Cargo will not let us override it
+          # without putting two copies of lee_core in the graph — see the long
+          # comment in scripts/pin-versions.sh.
+          GUEST_LEZ_REF=$(curl -fsSL "https://raw.githubusercontent.com/logos-co/spel/${SPEL_SHA}/spel-framework/Cargo.toml" \
+            | grep 'nssa_core' | grep -oE '(tag|rev) = "[^"]*"' | head -1 | cut -d'"' -f2)
+          [ -n "$GUEST_LEZ_REF" ] || { echo "could not read the LEZ pin from spel-framework/Cargo.toml"; exit 1; }
+          GUEST_LEZ_SHA=$(./scripts/resolve-ref.sh "$LEZ_GIT" "$GUEST_LEZ_REF")
+
+          # The LEZ the NODE runs is a choice: default to the same one, so the
+          # default run tests the combination SPEL claims to support.
+          if [ -n "$LEZ_REF" ]; then
+            NODE_LEZ_SHA=$(./scripts/resolve-ref.sh "$LEZ_GIT" "$LEZ_REF")
+          else
+            LEZ_REF="$GUEST_LEZ_REF"
+            NODE_LEZ_SHA="$GUEST_LEZ_SHA"
+          fi
+
+          if [ "$NODE_LEZ_SHA" = "$GUEST_LEZ_SHA" ]; then
+            MODE="matched — guests and node on the same LEZ"
+          else
+            MODE="forward-compat — guests built on \`$GUEST_LEZ_REF\`, node running \`$LEZ_REF\`"
+          fi
+
+          {
+            echo "spel_sha=$SPEL_SHA"
+            echo "guest_lez_sha=$GUEST_LEZ_SHA"
+            echo "node_lez_sha=$NODE_LEZ_SHA"
+            echo "mode=$MODE"
+          } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### Versions under test"
+            echo ""
+            echo "$MODE"
+            echo ""
+            echo "| | ref | commit |"
+            echo "|---|---|---|"
+            echo "| SPEL | \`$SPEL_REF\` | [\`${SPEL_SHA:0:8}\`](https://github.com/logos-co/spel/commit/$SPEL_SHA) |"
+            echo "| LEZ (guests compiled against) | \`$GUEST_LEZ_REF\` | [\`${GUEST_LEZ_SHA:0:8}\`](https://github.com/logos-blockchain/logos-execution-zone/commit/$GUEST_LEZ_SHA) |"
+            echo "| LEZ (node runs) | \`$LEZ_REF\` | [\`${NODE_LEZ_SHA:0:8}\`](https://github.com/logos-blockchain/logos-execution-zone/commit/$NODE_LEZ_SHA) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── LEZ node binaries. Cached on the LEZ commit, so this is usually a no-op ──
+  lez:
+    name: LEZ binaries
+    runs-on: ubuntu-latest
+    needs: resolve
+    timeout-minutes: 90
+    steps:
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config libssl-dev cmake
+
+      - name: Cache LEZ binaries
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            /tmp/lez-bin/sequencer_service
+            /tmp/lez-bin/wallet
+          key: lez-bin-${{ needs.resolve.outputs.node_lez_sha }}
+
+      - name: Install logos-blockchain-circuits
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: curl -sSL https://raw.githubusercontent.com/logos-blockchain/logos-blockchain/1da154c74b911318fb853d37261f8a05ffe513b4/scripts/setup-logos-blockchain-circuits.sh | bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build sequencer and wallet
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$LEZ_GIT" /tmp/lez-src
+          git -C /tmp/lez-src checkout ${{ needs.resolve.outputs.node_lez_sha }}
+          cd /tmp/lez-src
+          # `standalone` is mandatory: without it the sequencer blocks forever
+          # on a Bedrock node at localhost:18080 and never serves RPC.
+          cargo build --release --features standalone -p sequencer_service
+          cargo build --release -p wallet
+          mkdir -p /tmp/lez-bin
+          cp target/release/sequencer_service target/release/wallet /tmp/lez-bin/
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: lez-bin
+          path: /tmp/lez-bin/
+          retention-days: 1
+
+  # ── Guest binaries. Cached on (SPEL, LEZ, guest sources) ────────────────
+  guests:
+    name: Guest binaries
+    runs-on: ubuntu-latest
+    needs: resolve
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Pin guests to the versions under test
+        run: ./scripts/pin-versions.sh "${{ needs.resolve.outputs.spel_sha }}"
+
+      # The cache key covers the pinned manifests and locks as well as the guest
+      # sources, so any version change or source edit rebuilds.
+      - name: Cache guest binaries
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ledger/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/ledger.bin
+            vault/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/vault.bin
+          key: guests-${{ needs.resolve.outputs.spel_sha }}-${{ needs.resolve.outputs.guest_lez_sha }}-${{ hashFiles('*/methods/guest/src/**', '*/methods/guest/Cargo.*', '*/*_core/src/**') }}
+
+      - name: Install risc0 toolchain
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          curl -L https://risc0.com/install | bash
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.risc0/bin:$PATH"
+          rzup install cargo-risczero "$RISC0_VERSION"
+          rzup install rust
+
+      - name: Build guests
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          # Hermetic Docker builds — reproducible ImageIDs, and the reason a
+          # cross-project path dependency cannot work (see NOTES.md).
+          for p in ledger vault; do
+            echo "::group::$p guest"
+            ( cd "$p" && make build )
+            echo "::endgroup::"
+          done
+
+      - name: Report ProgramIds
+        run: ls -la */methods/guest/target/riscv32im-risc0-zkvm-elf/docker/*.bin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: guest-bin
+          path: '*/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/*.bin'
+          retention-days: 1
+
+  # ── The actual on-chain run ─────────────────────────────────────────────
+  e2e:
+    name: E2E
+    runs-on: ubuntu-latest
+    needs: [resolve, lez, guests]
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libpcsclite-dev pkg-config libssl-dev cmake
+
+      - uses: actions/download-artifact@v4
+        with: { name: guest-bin, path: . }
+
+      - uses: actions/download-artifact@v4
+        with: { name: lez-bin, path: /tmp/lez-bin }
+
+      - name: Check the downloaded layout
+        run: |
+          set -euo pipefail
+          for f in ledger/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/ledger.bin \
+                   vault/methods/guest/target/riscv32im-risc0-zkvm-elf/docker/vault.bin \
+                   /tmp/lez-bin/sequencer_service /tmp/lez-bin/wallet; do
+            [ -f "$f" ] || { echo "missing $f — artifact layout changed"; find . /tmp/lez-bin -name '*.bin' -o -name 'wallet' | head -20; exit 1; }
+          done
+          echo "all four binaries present"
+
+      # The e2e script reads the sequencer and wallet configs out of the LEZ
+      # repo at the commit under test (`git show <sha>:...`), because a config
+      # from a different version is rejected with a bare serde error. So it
+      # needs a real checkout, not just the two binaries.
+      - name: Check out LEZ at the commit under test
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$LEZ_GIT" /tmp/lssa
+          git -C /tmp/lssa checkout ${{ needs.resolve.outputs.node_lez_sha }}
+          mkdir -p /tmp/lssa/target/release
+          install -m 0755 /tmp/lez-bin/sequencer_service /tmp/lez-bin/wallet /tmp/lssa/target/release/
+
+      - name: Cache spel CLI
+        id: cache-spel
+        uses: actions/cache@v4
+        with:
+          path: /tmp/spel-bin/spel
+          key: spel-cli-${{ needs.resolve.outputs.spel_sha }}
+
+      - name: Install logos-blockchain-circuits
+        if: steps.cache-spel.outputs.cache-hit != 'true'
+        run: curl -sSL https://raw.githubusercontent.com/logos-blockchain/logos-blockchain/1da154c74b911318fb853d37261f8a05ffe513b4/scripts/setup-logos-blockchain-circuits.sh | bash
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the spel CLI at the commit under test
+        if: steps.cache-spel.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none "$SPEL_GIT" /tmp/spel-src
+          git -C /tmp/spel-src checkout ${{ needs.resolve.outputs.spel_sha }}
+          cargo build --release -p spel --manifest-path /tmp/spel-src/Cargo.toml
+          mkdir -p /tmp/spel-bin
+          cp /tmp/spel-src/target/release/spel /tmp/spel-bin/spel
+
+      - name: Put spel on PATH
+        run: |
+          chmod +x /tmp/spel-bin/spel
+          echo "/tmp/spel-bin" >> "$GITHUB_PATH"
+
+      - name: Run the CPI end-to-end test
+        env:
+          LSSA_DIR: /tmp/lssa
+          LEZ_REF: ${{ needs.resolve.outputs.node_lez_sha }}
+          SKIP_BUILD: '1'
+        run: ./scripts/e2e-test.sh "$RUNNER_TEMP/e2e"
+
+      - name: Summarize
+        if: always()
+        run: |
+          if [ "${{ job.status }}" = "success" ]; then
+            echo "✅ CPI e2e passed: ledger total 0 → 500 → 750 via ChainedCall" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "❌ CPI e2e failed — see the \`e2e-logs\` artifact" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload run logs
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-logs
+          path: ${{ runner.temp }}/e2e/*.log
+          retention-days: 14
+
+  # ── Only unattended runs file issues; a manual run just shows red ───────
+  report:
+    name: Report failure
+    runs-on: ubuntu-latest
+    needs: [resolve, lez, guests, e2e]
+    timeout-minutes: 10
+    if: failure() && needs.resolve.result == 'success' && (github.event_name == 'schedule' || github.event_name == 'repository_dispatch')
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const spel = '${{ needs.resolve.outputs.spel_sha }}';
+            const lez  = '${{ needs.resolve.outputs.node_lez_sha }}';
+            const mode = '${{ needs.resolve.outputs.mode }}';
+            const title = `CPI e2e failed — SPEL ${spel.slice(0,8)} / LEZ ${lez.slice(0,8)}`;
+
+            // One issue per version pair: reopen and comment rather than pile up
+            // a new issue every Monday for a failure nobody has fixed yet.
+            const { data: found } = await github.rest.issues.listForRepo({
+              owner: context.repo.owner, repo: context.repo.repo,
+              state: 'all', labels: 'cpi-e2e-failure', per_page: 100,
+            });
+            const existing = found.find(i => i.title === title);
+            const body = [
+              `The chained-call end-to-end run failed.`, ``,
+              `| | commit |`, `|---|---|`,
+              `| SPEL | https://github.com/logos-co/spel/commit/${spel} |`,
+              `| LEZ (node) | https://github.com/logos-blockchain/logos-execution-zone/commit/${lez} |`,
+              ``, `Mode: ${mode}`,
+              ``,
+              `[Run logs](${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}) — the \`e2e-logs\` artifact has the sequencer log and every transaction's output.`,
+              ``,
+              `Because both guests are rebuilt against the SPEL commit under test, a failure here is a real incompatibility, not a stale binary.`,
+            ].join('\n');
+
+            if (existing) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: existing.number, body: `Failed again.\n\n${body}`,
+              });
+              if (existing.state === 'closed') {
+                await github.rest.issues.update({
+                  owner: context.repo.owner, repo: context.repo.repo,
+                  issue_number: existing.number, state: 'open',
+                });
+              }
+            } else {
+              await github.rest.issues.create({
+                owner: context.repo.owner, repo: context.repo.repo,
+                title, body, labels: ['cpi-e2e-failure'],
+              });
+            }
