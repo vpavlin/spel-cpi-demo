@@ -1,0 +1,119 @@
+{
+  "accounts": [
+    {
+      "name": "VaultConfig",
+      "type": {
+        "fields": [
+          {
+            "name": "admin",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ],
+        "kind": "struct"
+      }
+    },
+    {
+      "name": "VaultAccount",
+      "type": {
+        "fields": [
+          {
+            "name": "owner",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "balance",
+            "type": "u64"
+          }
+        ],
+        "kind": "struct"
+      }
+    }
+  ],
+  "errors": [],
+  "instructions": [
+    {
+      "accounts": [
+        {
+          "init": true,
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": "vault_config"
+              }
+            ]
+          },
+          "signer": false,
+          "writable": true
+        },
+        {
+          "init": false,
+          "name": "admin",
+          "signer": true,
+          "writable": false
+        }
+      ],
+      "args": [],
+      "name": "initialize"
+    },
+    {
+      "accounts": [
+        {
+          "init": false,
+          "name": "vault_account",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "owner"
+              }
+            ]
+          },
+          "signer": false,
+          "writable": true
+        },
+        {
+          "init": false,
+          "name": "owner",
+          "signer": true,
+          "writable": false
+        },
+        {
+          "init": false,
+          "name": "log",
+          "signer": false,
+          "writable": false
+        }
+      ],
+      "args": [
+        {
+          "name": "ledger_program_id",
+          "type": "program_id"
+        },
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ],
+      "name": "deposit"
+    }
+  ],
+  "name": "vault",
+  "types": [],
+  "version": "0.1.0"
+}

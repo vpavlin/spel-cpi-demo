@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "vault_core",
+    "vault_ffi",
+    "methods",
+    "examples",
+]
+exclude = [
+    "methods/guest",
+]
+resolver = "2"

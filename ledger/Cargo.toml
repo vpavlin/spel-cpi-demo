@@ -1,0 +1,11 @@
+[workspace]
+members = [
+    "ledger_core",
+    "ledger_ffi",
+    "methods",
+    "examples",
+]
+exclude = [
+    "methods/guest",
+]
+resolver = "2"
