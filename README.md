@@ -167,9 +167,10 @@ scripts run locally:
 ./scripts/pin-versions.sh main
 ```
 
-A fully cold run takes roughly an hour, most of it the two Docker guest builds
-and the LEZ release build. With all three caches warm it is the `e2e` job only,
-a few minutes.
+Measured on GitHub's runners: **~18 min cold** (the two Docker guest builds and
+the LEZ release build run in parallel), **~10 min warm** — the `guests` and
+`lez` jobs drop to under a minute each on a cache hit, and what is left is the
+risc0 toolchain install plus the chain run itself.
 
 ## Notes
 
