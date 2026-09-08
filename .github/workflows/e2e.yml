@@ -286,6 +286,20 @@ jobs:
           chmod +x /tmp/spel-bin/spel
           echo "/tmp/spel-bin" >> "$GITHUB_PATH"
 
+      # The sequencer executes the genesis transaction through risc0 at
+      # startup, so it needs the toolchain at *run* time, not just at build
+      # time. Without it the node dies immediately with a bare
+      #   ProgramExecutionFailed("No such file or directory (os error 2)")
+      # which names neither risc0 nor the missing binary. This mirrors what
+      # SPEL's own sequencer-backed CI jobs install.
+      - name: Install risc0 toolchain
+        run: |
+          curl -L https://risc0.com/install | bash
+          echo "$HOME/.risc0/bin" >> "$GITHUB_PATH"
+          export PATH="$HOME/.risc0/bin:$PATH"
+          rzup install cargo-risczero "$RISC0_VERSION"
+          rzup install rust
+
       - name: Run the CPI end-to-end test
         env:
           LSSA_DIR: /tmp/lssa

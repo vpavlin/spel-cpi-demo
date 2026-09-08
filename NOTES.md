@@ -143,6 +143,12 @@ Not doc bugs — but every one of these cost a debugging cycle here, and
   now refuses to start if its port is already occupied.
 - **Use a fresh sequencer home per run**, otherwise re-deploying the same
   binaries hits `ProgramAlreadyExists`.
+- **The risc0 toolchain is a *runtime* dependency of the sequencer**, not just
+  a build one: it executes the genesis transaction through risc0 at startup.
+  Miss it and the node dies instantly with
+  `ProgramExecutionFailed("No such file or directory (os error 2)")`, which
+  names neither risc0 nor the file it wanted. This one only shows up on a
+  machine that has never built a guest — a fresh CI runner, or a new laptop.
 
 ## 6. What worked well
 

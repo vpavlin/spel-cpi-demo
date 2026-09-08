@@ -39,6 +39,10 @@ fail() {
     if [ -f "$WORK_DIR/sequencer.log" ]; then
         echo -e "${RED}--- sequencer rejections ---${NC}"
         grep -A2 "failed execution check" "$WORK_DIR/sequencer.log" | tail -12 || echo "  (none)"
+        # A startup crash leaves no rejections at all, and its cause is only in
+        # the tail — printing it here saves digging a log out of CI artifacts.
+        echo -e "${RED}--- last of sequencer.log ---${NC}"
+        tail -8 "$WORK_DIR/sequencer.log"
     fi
     exit 1
 }
